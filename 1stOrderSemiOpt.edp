@@ -1,0 +1,196 @@
+//Programa para Solução do Modelo C de Solidificação
+//André Macieira Braga Costa - Maio de 2018
+//Departamento de Matemática - UFMG
+//Departamento de Engenharia Mecânica - UFMG
+verbosity=0;
+int save=1;//set this variable to 1 to save vtks and 0 otherwise
+//////////create mesh////////////
+//From scratch
+mesh Th=square(2400,2400,[960*x,960*y]);
+mesh Th1=square(2400,2400,[960*x,960*y]);
+//From files (in case you want to resume simulation from an intermediate point) 
+//mesh Th=readmesh("pmesh.msh");
+//mesh Th1=readmesh("Tmesh.msh");
+load "iovtk"
+
+//Constantes do Modelo
+//Model Parameters
+real tau0=1;
+real W0=1;        
+real D=10;
+real lambda=D*tau0/(0.6267*W0^2);
+real em=0.05;
+real R=8;
+real s=0;
+
+//Condições Iniciais
+//Initial conditions
+func p0=(x^2+y^2<R^2)-(x^2+y^2>(R+W0)^2)+(x^2+y^2>R^2)*(x^2+y^2<(R+W0)^2)*((2*R+W0-2*sqrt(x^2+y^2))/W0);
+//func p0=-tanh((sqrt(x^2+y^2)-R)/sqrt(2));
+func T0=-0.3;
+//Parâmetros Temporais
+real dt=0.01; //time step
+real Tf=1500;  //final run time
+real ti=0;  //initial time
+
+
+//Gradiente como macro:
+macro grad(f) [dx(f) , dy(f)] //gradiente
+
+//create the finite element spaces and define all the functions that will be used
+fespace Vh(Th,P1); // P1 FE space
+fespace Vh1(Th1,P1); 
+Vh p=p0,w,pold,T1,Xcor=x,Ycor=y,dxpold,dypold;    
+Vh W,dW,tau,a;//Anisotropy
+Vh1 T=T0,q,Told,p1,p2;
+ifstream ff("solutionp.txt");  //Use this in case you want to read p from a file
+ff>>p[];
+ifstream gg("solutionT.txt");  //Use this in case you want to read T from a file
+gg>>T[];
+
+// Equação do Parâmetro de Ordem
+//Phase-field equation definition - set solver to GMRES
+problem AllenCahn(p,w,solver=GMRES,tgv=1e20) =
+int2d(Th) (tau*p*w/dt)
++int2d(Th)(s*p*w)
+-int2d(Th)(s*pold*w) 
++int2d(Th)(W^2*grad(p)'*grad(w)) 
+-int2d(Th)((pold-pold^3)*w)
++int2d(Th)(T1*lambda*(1-2*pold^2+pold^4)*w)
+-int2d(Th)(tau*pold*w/dt)
++int2d(Th)(W*dW*(dy(p)*dx(w)-dx(p)*dy(w))); 
+
+// Equação da Temperatura 
+//Temperature equation definition - set solver to GMRES
+problem Temperature(T,q,solver=GMRES,tgv=1e20) = 
+int2d(Th1)(T*q/dt)
++int2d(Th1)(D*grad(T)'*grad(q)) 
+-int2d(Th1)(0.5*p1*q/dt)
++int2d(Th1)(0.5*p2*q/dt)
+-int2d(Th1)(Told*q/dt);                       
+               
+//Iterações no Tempo
+//Some variables used to store data, perform the loop iterations and track run time
+int nsteps=floor(Tf/dt); 
+real[int] freeEnergy(nsteps);
+real[int] interfacePosition(nsteps);
+real[int] time(nsteps);
+real ACtime=0;
+real cpu;
+real Looptime=0;
+real cpu1;
+real AMtime=0;
+real Ttime=0;
+
+
+cpu1=clock();
+for(int i=0;i<nsteps;i+=1){  //loop do tipo "for" para realizar a evoluÃ§Ã£o no tempo
+	cpu=clock();
+	if (i%4==0){ //mesh adaptation	
+		Th=adaptmesh(Th,p,hmin=0.2,ratio=1.4,iso=true,err=1e-3,nbvx=120000);
+		Th1=adaptmesh(Th1,T,hmin=0.4,ratio=1.1,iso=true,err=1e-3,nbvx=120000);
+		Xcor=x;
+		Ycor=y;	
+	}
+	AMtime=AMtime+clock()-cpu;
+	time[i]=ti+(i+1)*dt;
+	//update the functions
+	pold=p;
+	Told=T;
+	T1=T;
+	//compute anisotropy functions
+    a=(1-3*em+4*em*((dx(pold)^4+dy(pold)^4)/(1e-4+dx(pold)^2+dy(pold)^2)^2));
+	tau=tau0*a*a;
+	W=W0*a;
+	dW=16*W0*em*(dx(pold)*dy(pold)*(dx(pold)^2-dy(pold)^2)/(1e-4+dx(pold)^2+dy(pold)^2)^2);
+	cpu=clock();	
+	AllenCahn;//solve the phase-field equation
+	ACtime=ACtime+clock()-cpu;	
+	if (i%100==99){//compute free energy and interface position on the X-axis
+	freeEnergy[i]=int2d(Th)(0.5*W^2*grad(p)'*grad(p))+int2d(Th)((-0.5*p^2+0.25*p^4))+int2d(Th)(T1*lambda*(p-0.66667*p^3+0.2*p^5));
+	//get interface location
+	real pplus=1;
+	real pminus=-1;
+	int nodalIndexplus=0;
+	int nodalIndexminus=0;
+	for(int j=0;j<p[].n;j++){
+		if (Ycor[][j]==0){
+			if (p[](j)>0 && p[](j)< pplus){	
+				pplus=(p[](j));//get the data for the nodes on the border	
+				nodalIndexplus=j;}
+			if (p[](j)<0 && p[](j)> pminus){	
+				pminus=(p[](j));//get the data for the nodes on the border	
+				nodalIndexminus=j;}		
+		}
+	}
+	interfacePosition[i]=(pminus*Xcor[](nodalIndexplus)-pplus*Xcor[](nodalIndexminus))/(pminus-pplus);
+	//cout<< pplus <<endl;	
+	//cout<< pminus <<endl;
+	//cout<< Xcor[](nodalIndexplus) <<endl;
+	//cout<< Xcor[](nodalIndexminus) <<endl;
+	//cout<< interfacePosition[nsteps-1]<<endl;	
+	}
+	//done with interface location
+	//uptade p1 and p2 
+	p1=p;
+	p2=pold;
+	cpu=clock();
+	Temperature; //solve the temperature equation
+	Ttime=Ttime+clock()-cpu;
+		
+	//save vtk
+	if (i%(int(nsteps/30))==0 && save==1){
+		//string OutputFile="result0-"+int(i/int(nsteps/20))+".vtk";
+		string OutputFile1="pf1stOrderSemi-"+int(i/int(nsteps/30))+".vtk";
+		string OutputFile2="T1stOrderSemi-"+int(i/int(nsteps/30))+".vtk";
+		savevtk(OutputFile1, Th, p,dataname="Phase-Field");
+		savevtk(OutputFile2, Th1, T,dataname="Temperature");
+		ofstream fff("solutionp.txt");//Salvar solução p em um arquivo de texto (apenas no último instante de tempo)
+		fff << p[];
+		ofstream ggg("solutionT.txt");//Salvar solução T em um arquivo de texto (apenas no último instante de tempo)
+		ggg << T[];
+		savemesh(Th,"pmesh.msh");
+		savemesh(Th1,"Tmesh.msh");
+	}
+	if (i%(int(nsteps/15))==0 && save==1){
+	ofstream file2("longrunBDF1datadt1e-2.val");
+	file2 << "2 1 1 "<< nsteps << " 2 \n";
+	for (int j=0;j<nsteps ; j++){
+	file2 << time[j] <<" "<< interfacePosition[j] <<" "<< freeEnergy[j] << endl;}
+	}
+	
+}
+Looptime=clock()-cpu1;
+cout << "Tempo gasto AllenCahn " <<ACtime<<endl;
+cout << "Tempo gasto Temperatura " <<Ttime<<endl;
+cout << "Tempo gasto Adaptmesh " <<AMtime<<endl;
+cout << "Tempo total do Loop " <<Looptime<<endl;
+//ofstream fff("solutionp.txt");//Salvar solução p em um arquivo de texto (apenas no último instante de tempo)
+//fff << p[];
+//ofstream ggg("solutionT.txt");//Salvar solução T em um arquivo de texto (apenas no último instante de tempo)
+//ggg << T[];
+//savemesh(Th,"pmesh.msh");
+//savemesh(Th1,"Tmesh.msh");
+//plot(a,value=true,fill=true,ColorScheme=2);
+plot(p,value=true,fill=true,ColorScheme=2);
+plot(T,value=true,fill=true,ColorScheme=2);
+plot(Th);
+plot(Th1);
+
+ofstream file2("longrunBDF1datadt1e-2.val");
+file2 << "2 1 1 "<< nsteps << " 2 \n";
+for (int j=0;j<nsteps ; j++){
+file2 << time[j] <<" "<< interfacePosition[j] <<" "<< freeEnergy[j] << endl;
+}
+
+
+
+
+
+
+
+
+
+
+
+
